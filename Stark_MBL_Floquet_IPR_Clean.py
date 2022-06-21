@@ -1,118 +1,160 @@
 import numpy as np
-from sympy.utilities.iterables import multiset_permutations
-import scipy.special
 import scipy.sparse as spr
 import scipy.sparse.linalg as splng
+from numba import jit
 import matplotlib.pyplot as plt
 
-#Swapping operators
-def Operators(L):
-    c = []
+#IPRs averaged over evecs and disorder calculated as a function
+#of unkicked period T_0.
+
+#calculate dimensionality for half filling
+@jit
+def Binom(n,k):
+    ret = 1
+    for i in range(min(k,n-k)):
+        ret *= n-i
+        ret /= i+1
+    return ret
+
+#state to label
+@jit
+def S2L(L,l_vec):
+    N = L/2
+    l_counter = 1
+    n_counter = N
+    for i in range(L):
+        if l_vec[i] == 0:
+            l_counter += Binom(L-(i+1),n_counter-1)
+        if l_vec[i] == 1:
+            n_counter -= 1
+        if n_counter == 0:
+            return l_counter
+
+#label to state
+@jit
+def L2S(L,l):
+    N = L/2
+    n_counter = N
+    l_counter = l
+    l_vec = np.zeros(L)
+    for i in range(L):
+        binom = Binom(L-(i+1),n_counter-1)
+        if n_counter == 0:
+            l_vec[i] = 0
+            continue
+        if l_counter > binom:
+            l_vec[i] = 0
+            l_counter -= binom
+            continue
+        if l_counter <= binom:
+            l_vec[i] = 1
+            n_counter -= 1
+    return l_vec
+
+#generate states via hopping terms
+def Hop(L,input):
+    input = np.ndarray.astype(input,int) #input state
+    output_lst = [] #appended list of output states
     for i in range(L-1):
-        op = np.eye(L)
-        op[i,i] = 0
-        op[i+1,i+1] = 0
-        op[i,i+1] = 1
-        op[i+1,i] = 1
-        c.append(op)
-    op = np.eye(L) #open boundaries
-    op[L-1,L-1] = 0
-    op[0,0] = 0
-    op[L-1,0] = 1
-    op[0,L-1] = 1
-    c.append(op)
-    return c
+        if input[i] == 1 and input[i+1] == 0: #hopping to the right
+            output = np.copy(input)
+            output[i] = 0
+            output[i+1] = 1
+            output_lst.append(output)
+        if input[i] == 0 and input[i+1] == 1: #hopping to the left
+            output = np.copy(input)
+            output[i] = 1
+            output[i+1] = 0
+            output_lst.append(output)
+    ns = np.shape(output_lst)[0] #number of output states
+    return output_lst,ns
 
-#Fock states
-def Hilbert(L):
-    a = np.zeros(L)
-    a[0:int(L/2)] = 1 #fill left half of sites
-    a = np.ndarray.astype(a,int)
-    vec = list(multiset_permutations(a)) #find all permutations
-    bits = np.packbits(vec,axis=-1) #decimal values of Fock states
-    return vec,bits
-
-#locate regions where swap operations are allowed
-def Swap(a,n=2):
-    ret = np.cumsum(a,axis=0,dtype=float)
-    ret[n:] = ret[n:]-ret[:-n]
-    swap = np.where(ret[n-1:]==1)
-    return swap[0],np.size(swap[0])
-
-def Diag(L):
-    Dim = int(scipy.special.comb(L,L/2))
-    H = np.zeros((Dim,Dim)) #Hamiltonian
-    c = Operators(L)
-    vec,bits = Hilbert(L)
+#diagonal elements of static Hamiltonian
+def Diag(L,Dim,gamma,w,V):
+    row = np.empty(Dim*L)
+    col = np.empty(Dim*L)
+    data = np.empty(Dim*L)
+    nnz = 0
     for i in range(Dim):
-        A = vec[i] #select vector
-        v = 0 #interaction counter
+        state = L2S(L,i+1) #select vector
+        v = 0 #nearest-neighbour interaction counter
+        g = 0 #field interaction counter
+        h = 0 #disorder interaction counter
         for k in range(L):
-            n = -gamma*k #tilted potential
-            H[i,i] = H[i,i]+n*A[k] #apply tilted potential
-            H[i,i] = H[i,i]+np.random.normal(0,w)*A[k] #apply disorder
+            g = g-gamma*k*state[k] #count field interactions
+            h = h+np.random.normal(0,w)*state[k] #count disorder interactions
         for k in range(L-1):
-            v = v+A[k]*A[k+1] #count interactions
-        v = v+A[L-1]*A[0] #open boundary interaction
-        H[i,i] = H[i,i]+V*v #apply interactions
-    return H
+            v = v+V*state[k]*state[k+1] #count nearest-neighbour interactions
+        row[nnz] = i #H[i,i] = g+h+v
+        col[nnz] = i
+        data[nnz] = g+h+v
+        nnz += 1
+    return spr.csc_matrix((data[:nnz],(row[:nnz],col[:nnz])),shape=(Dim,Dim))
 
-def Offdiag(L):
-    Dim = int(scipy.special.comb(L,L/2))
-    H = np.zeros((Dim,Dim)) #Hamiltonian
-    c = Operators(L)
-    vec,bits = Hilbert(L)
+#off-diagonal elements of static Hamiltonian
+def Offdiag(L,Dim,J):
+    row = np.empty(Dim*L)
+    col = np.empty(Dim*L)
+    data = np.empty(Dim*L)
+    nnz = 0
     for i in range(Dim):
-        A = vec[i]
-        swap,ns = Swap(A) #find sites where swap is allowed
-        for k in range(ns):
-            k = swap[k]
-            B = c[k]@A #apply swap operator
-            j = np.where((np.packbits(B.astype(int))==bits).all(axis=1))[0][0] #find index of new vector
-            H[i,j] = 1 #apply hopping elements to matrix
-            H[j,i] = 1
-        if A[0]+A[L-1] == 1: #open boundaries
-            B = c[L-1]@A
-            j = np.where((np.packbits(B.astype(int))==bits).all(axis=1))[0][0]
-            H[i,j] = 1
-            H[j,i] = 1
-    return H
+        input = L2S(L,i+1) #generate Fock state
+        output_lst,ns = Hop(L,input) #generate new states via hopping
+        for k in range(ns): #loop through all states generated by hopping
+            output = output_lst[k] #select output state
+            j = int(S2L(L,output)-1) #convert to label
+            row[nnz] = i #H[i,j] = J
+            col[nnz] = j
+            data[nnz] = J
+            nnz += 1
+    return spr.csc_matrix((data[:nnz],(row[:nnz],col[:nnz])),shape=(Dim,Dim))
 
-def IPR(L,T_0):
-    Dim = int(scipy.special.comb(L,L/2))
-    f = int(np.ceil(navg/Dim))
+#calculate IPRs
+def IPR(L,Dim,T_0,T_1,H_0,H_1,navg):
+    f = int(np.ceil(navg/Dim)) #number of disorder realisations
     I = np.zeros(f)
     for x in range(f):
-        H_Diag = Diag(L)
-        F = splng.expm(-1j*H_Diag*T_0)@splng.expm(-1j*J*H_Offdiag*T_1) #Floquet operator
-        U = np.linalg.eig(F)[1] #calculate evecs
-        I[x] = np.mean(np.sum(np.abs(U)**4,axis=1)) #average over evecs
-    return np.mean(I)
+        F = splng.expm(-1j*H_0*T_0)@splng.expm(-1j*H_1*T_1) #Floquet operator
+        U = np.linalg.eig(F.todense())[1] #calculate evecs
+        U = np.array(U) #convert from matrix object to array
+        I[x] = np.mean(np.sum(np.abs(U)**4,axis=1)) #average IPR over evecs
+    return np.mean(I) #average IPR over disorder
 
-#Parameters
-L_lst = np.array([8,10,12,14,16]) #system size
-J = 0.5 #hopping amplitude
-V = 0.5 #interaction strength
-gamma = 5 #potential strength
-w = 0.05 #disorder strength
-navg = 3000 #total averaging
-T_1 = 0.1 #kicked period
-T_0_lst = 2*np.pi*np.arange(2.5,25,2.5)*0.1/gamma #unkicked period
+#loop through system sizes and unkicked periods
+def Loops():
+    L_lst,J,V,gamma,w,navg,T_1,T_0_lst,ng,nl = Parameters() #system parameters
+    I = np.zeros((nl,ng)) #size of IPR array
+    for i in range(nl):
+        L = L_lst[i] #update L
+        Dim = int(Binom(L,L/2)) #dimensionality for given L
+        H_1 = Offdiag(L,Dim,J) #off-diagonal part of Hamiltonian
+        for j in range(ng):
+            T_0 = T_0_lst[j] #update T_0
+            H_0 = Diag(L,Dim,gamma,w,V) #diagonal part of Hamiltonian
+            I[i,j] = IPR(L,Dim,T_0,T_1,H_0,H_1,navg) #calculate IPR
+    return I
 
-ng = np.size(T_0_lst)
-nl = np.size(L_lst)
-I = np.zeros((nl,ng))
-Dim_lst = np.zeros(nl)
-for i in range(nl):
-    L = L_lst[i]
-    Dim_lst[i] = int(scipy.special.comb(L,L/2))
-    H_Offdiag = Offdiag(L)
-    for j in range(ng):
-        I[i,j] = IPR(L,T_0_lst[j])
+#plot IPRs
+def Plot(I):
+    L_lst,J,V,gamma,w,navg,T_1,T_0_lst,ng,nl = Parameters() #system parameters
+    plt.figure(1)
+    for i in range(np.size(L_lst)):
+        plt.plot(T_0_lst*gamma/(2*np.pi),I[i],'-x',label=r'$L={}$'.format(L_lst[i]))
+    plt.xlabel(r'$\gamma T_0/2\pi$')
+    plt.ylabel(r'$I(T_0)$')
+    plt.legend(ncol=2,fontsize=10)
 
-plt.figure(1)
-for i in range(nl):
-    plt.plot(T_0_lst*gamma/(2*np.pi),I[i],'-x',label=r'$L={}$'.format(L_lst[i]))
-plt.xlabel(r'$\gamma T_0/2\pi$')
-plt.ylabel(r'$I(T_0)$')
-plt.legend(ncol=2,fontsize=10)
+#system parameters
+def Parameters():
+    L_lst = np.array([6,8,10]) #system sizes
+    J = 0.5 #hopping amplitude
+    V = 0.5 #interaction strength
+    gamma = 5 #potential strength
+    w = 0.05 #disorder strength
+    navg = 100 #total averaging (disorder * number of evecs)
+    T_1 = 0.1 #kicked period
+    T_0_lst = 2*np.pi*np.arange(2.5,25,2.5)*0.1/gamma #unkicked period
+    return L_lst,J,V,gamma,w,navg,T_1,T_0_lst,np.size(T_0_lst),np.size(L_lst)
+
+I = Loops()
+Plot(I)
